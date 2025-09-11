@@ -5,6 +5,7 @@
 (define-constant ERR-ALREADY-EXISTS (err u104))
 (define-constant ERR-INVALID-STATUS (err u105))
 (define-constant ERR-INVALID-PARTICIPANT (err u106))
+(define-constant ERR-INVALID-SCORE (err u107))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var product-counter uint u0)
@@ -64,6 +65,36 @@
   { count: uint }
 )
 
+(define-map participant-quality-metrics
+  { participant: principal }
+  {
+    total-transactions: uint,
+    successful-transfers: uint,
+    temperature-violations: uint,
+    on-time-deliveries: uint,
+    late-deliveries: uint,
+    quality-score: uint,
+    last-updated: uint,
+    reputation-tier: (string-ascii 10)
+  }
+)
+
+(define-map quality-events
+  { participant: principal, event-id: uint }
+  {
+    event-type: (string-ascii 20),
+    score-impact: int,
+    timestamp: uint,
+    product-id: uint,
+    details: (string-ascii 100)
+  }
+)
+
+(define-map participant-quality-event-counts
+  { participant: principal }
+  { count: uint }
+)
+
 (define-private (is-contract-owner)
   (is-eq tx-sender (var-get contract-owner))
 )
@@ -109,6 +140,92 @@
   )
 )
 
+(define-private (get-next-quality-event-id (participant principal))
+  (let ((current-count (default-to u0 (get count (map-get? participant-quality-event-counts { participant: participant })))))
+    (map-set participant-quality-event-counts { participant: participant } { count: (+ current-count u1) })
+    current-count
+  )
+)
+
+(define-private (initialize-participant-quality (participant principal))
+  (if (is-none (map-get? participant-quality-metrics { participant: participant }))
+    (map-set participant-quality-metrics
+      { participant: participant }
+      {
+        total-transactions: u0,
+        successful-transfers: u0,
+        temperature-violations: u0,
+        on-time-deliveries: u0,
+        late-deliveries: u0,
+        quality-score: u1000,
+        last-updated: stacks-block-height,
+        reputation-tier: "new"
+      }
+    )
+    false
+  )
+)
+
+(define-private (calculate-reputation-tier (score uint))
+  (if (>= score u1500)
+    "platinum"
+    (if (>= score u1200)
+      "gold"
+      (if (>= score u800)
+        "silver"
+        (if (>= score u500)
+          "bronze"
+          "poor"
+        )
+      )
+    )
+  )
+)
+
+(define-private (record-quality-event (participant principal) (event-type (string-ascii 20)) (score-impact int) (product-id uint) (details (string-ascii 100)))
+  (let 
+    (
+      (event-id (get-next-quality-event-id participant))
+      (current-metrics (default-to 
+        { 
+          total-transactions: u0, 
+          successful-transfers: u0, 
+          temperature-violations: u0, 
+          on-time-deliveries: u0, 
+          late-deliveries: u0, 
+          quality-score: u1000, 
+          last-updated: u0, 
+          reputation-tier: "new" 
+        } 
+        (map-get? participant-quality-metrics { participant: participant })
+      ))
+      (new-score (+ (to-int (get quality-score current-metrics)) score-impact))
+      (final-score (if (< new-score 0) u0 (to-uint new-score)))
+    )
+    (map-set quality-events
+      { participant: participant, event-id: event-id }
+      {
+        event-type: event-type,
+        score-impact: score-impact,
+        timestamp: stacks-block-height,
+        product-id: product-id,
+        details: details
+      }
+    )
+    (map-set participant-quality-metrics
+      { participant: participant }
+      (merge current-metrics 
+        { 
+          quality-score: final-score,
+          last-updated: stacks-block-height,
+          reputation-tier: (calculate-reputation-tier final-score)
+        }
+      )
+    )
+    final-score
+  )
+)
+
 (define-public (authorize-participant (participant principal) (role (string-ascii 20)))
   (if (is-contract-owner)
     (begin
@@ -116,6 +233,7 @@
         { participant: participant }
         { role: role, authorized: true }
       )
+      (initialize-participant-quality participant)
       (ok true)
     )
     ERR-NOT-AUTHORIZED
@@ -207,9 +325,14 @@
               notes: notes
             }
           )
+          (record-quality-event tx-sender "transfer" 20 product-id "successful-transfer")
+          (record-quality-event to-party "received" 10 product-id "product-received")
           (ok true)
         )
-        ERR-INVALID-TEMPERATURE
+        (begin
+          (record-quality-event tx-sender "temp-violation" -50 product-id "temperature-out-of-range")
+          ERR-INVALID-TEMPERATURE
+        )
       )
       ERR-NOT-AUTHORIZED
     )
@@ -242,6 +365,7 @@
               notes: condition
             }
           )
+          (record-quality-event tx-sender "receive" 15 product-id "product-received-successfully")
           (ok true)
         )
         ERR-INVALID-TEMPERATURE
@@ -545,5 +669,111 @@
   (match (map-get? products { product-id: product-id })
     product (is-eq (get current-status product) "recalled")
     false
+  )
+)
+
+(define-public (update-quality-score (participant principal) (score-adjustment int) (reason (string-ascii 100)))
+  (if (is-contract-owner)
+    (let ((current-score (record-quality-event participant "manual-adjustment" score-adjustment u0 reason)))
+      (ok current-score)
+    )
+    ERR-NOT-AUTHORIZED
+  )
+)
+
+(define-read-only (get-participant-quality-score (participant principal))
+  (match (map-get? participant-quality-metrics { participant: participant })
+    metrics (get quality-score metrics)
+    u0
+  )
+)
+
+(define-read-only (get-participant-quality-metrics (participant principal))
+  (map-get? participant-quality-metrics { participant: participant })
+)
+
+(define-read-only (get-participant-reputation-tier (participant principal))
+  (match (map-get? participant-quality-metrics { participant: participant })
+    metrics (get reputation-tier metrics)
+    "unknown"
+  )
+)
+
+(define-read-only (get-quality-event (participant principal) (event-id uint))
+  (map-get? quality-events { participant: participant, event-id: event-id })
+)
+
+(define-read-only (get-top-quality-participants)
+  (fold rank-participant-by-quality (list tx-sender (var-get contract-owner)) (list))
+)
+
+(define-private (rank-participant-by-quality (participant principal) (acc (list 5 { participant: principal, score: uint })))
+  (let ((score (get-participant-quality-score participant)))
+    (if (> score u0)
+      (unwrap-panic (as-max-len? (append acc { participant: participant, score: score }) u5))
+      acc
+    )
+  )
+)
+
+(define-read-only (get-participants-by-tier (tier (string-ascii 10)))
+  (get results (fold filter-participants-by-tier (list tx-sender (var-get contract-owner)) { tier: tier, results: (list) }))
+)
+
+(define-private (filter-participants-by-tier (participant principal) (acc { tier: (string-ascii 10), results: (list 5 principal) }))
+  (if (is-eq (get-participant-reputation-tier participant) (get tier acc))
+    { tier: (get tier acc), results: (unwrap-panic (as-max-len? (append (get results acc) participant) u5)) }
+    acc
+  )
+)
+
+(define-read-only (validate-participant-quality (participant principal) (min-score uint))
+  (let ((current-score (get-participant-quality-score participant)))
+    {
+      meets-threshold: (>= current-score min-score),
+      current-score: current-score,
+      tier: (get-participant-reputation-tier participant),
+      authorized: (is-authorized participant)
+    }
+  )
+)
+
+(define-read-only (get-quality-statistics)
+  (let 
+    (
+      (sample-participants (list tx-sender (var-get contract-owner)))
+      (scores (map get-participant-quality-score sample-participants))
+      (total-score (fold + scores u0))
+      (participant-count (len sample-participants))
+    )
+    {
+      total-participants: participant-count,
+      average-score: (if (> participant-count u0) (/ total-score participant-count) u0),
+      platinum-count: (len (get-participants-by-tier "platinum")),
+      gold-count: (len (get-participants-by-tier "gold")),
+      silver-count: (len (get-participants-by-tier "silver")),
+      bronze-count: (len (get-participants-by-tier "bronze"))
+    }
+  )
+)
+
+(define-read-only (recommend-suppliers (min-score uint) (preferred-tier (string-ascii 10)))
+  (get results (fold filter-recommended-suppliers (list tx-sender (var-get contract-owner)) { min-score: min-score, tier: preferred-tier, results: (list) }))
+)
+
+(define-private (filter-recommended-suppliers (participant principal) (criteria { min-score: uint, tier: (string-ascii 10), results: (list 4 { participant: principal, score: uint, tier: (string-ascii 10) }) }))
+  (let 
+    (
+      (score (get-participant-quality-score participant))
+      (tier (get-participant-reputation-tier participant))
+    )
+    (if (and (>= score (get min-score criteria)) (is-eq tier (get tier criteria)))
+      { 
+        min-score: (get min-score criteria), 
+        tier: (get tier criteria), 
+        results: (unwrap-panic (as-max-len? (append (get results criteria) { participant: participant, score: score, tier: tier }) u4))
+      }
+      criteria
+    )
   )
 )
