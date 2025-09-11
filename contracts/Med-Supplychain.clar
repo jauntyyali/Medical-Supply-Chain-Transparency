@@ -6,6 +6,8 @@
 (define-constant ERR-INVALID-STATUS (err u105))
 (define-constant ERR-INVALID-PARTICIPANT (err u106))
 (define-constant ERR-INVALID-SCORE (err u107))
+(define-constant ERR-INVALID-BATCH-DATA (err u108))
+(define-constant ERR-INSUFFICIENT-BATCH-DATA (err u109))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var product-counter uint u0)
@@ -94,6 +96,60 @@
   { participant: principal }
   { count: uint }
 )
+
+(define-map batch-analytics
+  { batch-number: (string-ascii 20) }
+  {
+    total-products: uint,
+    products-recalled: uint,
+    avg-temp-violations: uint,
+    total-transfers: uint,
+    failed-transfers: uint,
+    avg-delivery-time: uint,
+    risk-score: uint,
+    risk-level: (string-ascii 10),
+    last-updated: uint,
+    manufacturer: principal
+  }
+)
+
+(define-map location-risk-metrics
+  { location: (string-ascii 50) }
+  {
+    total-events: uint,
+    temperature-violations: uint,
+    successful-transfers: uint,
+    failed-transfers: uint,
+    avg-risk-score: uint,
+    risk-tier: (string-ascii 10)
+  }
+)
+
+(define-map manufacturer-batch-stats
+  { manufacturer: principal }
+  {
+    total-batches: uint,
+    high-risk-batches: uint,
+    avg-batch-risk: uint,
+    total-recalls: uint,
+    manufacturing-quality-score: uint
+  }
+)
+
+(define-map risk-alerts
+  { alert-id: uint }
+  {
+    batch-number: (string-ascii 20),
+    manufacturer: principal,
+    risk-type: (string-ascii 20),
+    severity: (string-ascii 10),
+    alert-message: (string-ascii 100),
+    timestamp: uint,
+    acknowledged: bool
+  }
+)
+
+(define-data-var alert-counter uint u0)
 
 (define-private (is-contract-owner)
   (is-eq tx-sender (var-get contract-owner))
@@ -226,6 +282,176 @@
   )
 )
 
+(define-private (initialize-batch-analytics (batch-number (string-ascii 20)) (manufacturer principal))
+  (if (is-none (map-get? batch-analytics { batch-number: batch-number }))
+    (map-set batch-analytics
+      { batch-number: batch-number }
+      {
+        total-products: u0,
+        products-recalled: u0,
+        avg-temp-violations: u0,
+        total-transfers: u0,
+        failed-transfers: u0,
+        avg-delivery-time: u0,
+        risk-score: u100,
+        risk-level: "low",
+        last-updated: stacks-block-height,
+        manufacturer: manufacturer
+      }
+    )
+    false
+  )
+)
+
+(define-private (calculate-risk-level (risk-score uint))
+  (if (>= risk-score u800)
+    "critical"
+    (if (>= risk-score u600)
+      "high"
+      (if (>= risk-score u400)
+        "medium"
+        (if (>= risk-score u200)
+          "low"
+          "minimal"
+        )
+      )
+    )
+  )
+)
+
+(define-private (update-batch-risk-score (batch-number (string-ascii 20)) (risk-adjustment int) (event-type (string-ascii 20)))
+  (let 
+    (
+      (current-analytics (default-to 
+        { 
+          total-products: u0, 
+          products-recalled: u0, 
+          avg-temp-violations: u0, 
+          total-transfers: u0, 
+          failed-transfers: u0, 
+          avg-delivery-time: u0, 
+          risk-score: u100, 
+          risk-level: "low", 
+          last-updated: u0, 
+          manufacturer: tx-sender 
+        } 
+        (map-get? batch-analytics { batch-number: batch-number })
+      ))
+      (new-risk-score (+ (to-int (get risk-score current-analytics)) risk-adjustment))
+      (final-risk-score (if (< new-risk-score 0) u0 (to-uint new-risk-score)))
+      (new-risk-level (calculate-risk-level final-risk-score))
+    )
+    (map-set batch-analytics
+      { batch-number: batch-number }
+      (merge current-analytics 
+        { 
+          risk-score: final-risk-score,
+          risk-level: new-risk-level,
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (if (is-eq new-risk-level "critical")
+      (begin
+        (create-risk-alert batch-number (get manufacturer current-analytics) event-type "critical" "batch-risk-critical")
+        true
+      )
+      (if (is-eq new-risk-level "high")
+        (begin
+          (create-risk-alert batch-number (get manufacturer current-analytics) event-type "high" "batch-risk-elevated")
+          true
+        )
+        true
+      )
+    )
+    final-risk-score
+  )
+)
+
+(define-private (create-risk-alert (batch-number (string-ascii 20)) (manufacturer principal) (risk-type (string-ascii 20)) (severity (string-ascii 10)) (message (string-ascii 100)))
+  (let ((alert-id (+ (var-get alert-counter) u1)))
+    (var-set alert-counter alert-id)
+    (map-set risk-alerts
+      { alert-id: alert-id }
+      {
+        batch-number: batch-number,
+        manufacturer: manufacturer,
+        risk-type: risk-type,
+        severity: severity,
+        alert-message: message,
+        timestamp: stacks-block-height,
+        acknowledged: false
+      }
+    )
+    alert-id
+  )
+)
+
+(define-private (update-location-risk-metrics (location (string-ascii 50)) (event-type (string-ascii 20)) (success bool))
+  (let 
+    (
+      (current-metrics (default-to 
+        { 
+          total-events: u0, 
+          temperature-violations: u0, 
+          successful-transfers: u0, 
+          failed-transfers: u0, 
+          avg-risk-score: u100, 
+          risk-tier: "low" 
+        } 
+        (map-get? location-risk-metrics { location: location })
+      ))
+      (updated-metrics
+        (if success
+          (merge current-metrics 
+            { 
+              total-events: (+ (get total-events current-metrics) u1),
+              successful-transfers: (+ (get successful-transfers current-metrics) u1)
+            }
+          )
+          (merge current-metrics 
+            { 
+              total-events: (+ (get total-events current-metrics) u1),
+              failed-transfers: (+ (get failed-transfers current-metrics) u1)
+            }
+          )
+        )
+      )
+    )
+    (map-set location-risk-metrics { location: location } updated-metrics)
+    true
+  )
+)
+
+(define-private (update-manufacturer-stats (manufacturer principal) (batch-number (string-ascii 20)) (risk-score uint))
+  (let 
+    (
+      (current-stats (default-to 
+        { 
+          total-batches: u0, 
+          high-risk-batches: u0, 
+          avg-batch-risk: u100, 
+          total-recalls: u0, 
+          manufacturing-quality-score: u1000 
+        } 
+        (map-get? manufacturer-batch-stats { manufacturer: manufacturer })
+      ))
+      (is-high-risk (>= risk-score u600))
+      (updated-stats
+        (merge current-stats 
+          { 
+            total-batches: (+ (get total-batches current-stats) u1),
+            high-risk-batches: (if is-high-risk (+ (get high-risk-batches current-stats) u1) (get high-risk-batches current-stats)),
+            avg-batch-risk: (/ (+ (* (get avg-batch-risk current-stats) (get total-batches current-stats)) risk-score) (+ (get total-batches current-stats) u1))
+          }
+        )
+      )
+    )
+    (map-set manufacturer-batch-stats { manufacturer: manufacturer } updated-stats)
+    true
+  )
+)
+
 (define-public (authorize-participant (participant principal) (role (string-ascii 20)))
   (if (is-contract-owner)
     (begin
@@ -292,6 +518,7 @@
         }
       )
       (map-set product-event-counts { product-id: product-id } { count: u1 })
+      (initialize-batch-analytics batch-number tx-sender)
       (ok product-id)
     )
     ERR-NOT-AUTHORIZED
@@ -327,10 +554,14 @@
           )
           (record-quality-event tx-sender "transfer" 20 product-id "successful-transfer")
           (record-quality-event to-party "received" 10 product-id "product-received")
+          (update-batch-risk-score (get batch-number product) 25 "transfer-success")
+          (update-location-risk-metrics location "transfer" true)
           (ok true)
         )
         (begin
           (record-quality-event tx-sender "temp-violation" -50 product-id "temperature-out-of-range")
+          (update-batch-risk-score (get batch-number product) -100 "temp-violation")
+          (update-location-risk-metrics location "temp-violation" false)
           ERR-INVALID-TEMPERATURE
         )
       )
@@ -775,5 +1006,231 @@
       }
       criteria
     )
+  )
+)
+
+(define-public (acknowledge-risk-alert (alert-id uint))
+  (let ((alert (unwrap! (map-get? risk-alerts { alert-id: alert-id }) ERR-PRODUCT-NOT-FOUND)))
+    (if (or (is-contract-owner) (is-eq tx-sender (get manufacturer alert)))
+      (begin
+        (map-set risk-alerts
+          { alert-id: alert-id }
+          (merge alert { acknowledged: true })
+        )
+        (ok true)
+      )
+      ERR-NOT-AUTHORIZED
+    )
+  )
+)
+
+(define-public (manual-batch-risk-adjustment (batch-number (string-ascii 20)) (risk-adjustment int) (reason (string-ascii 100)))
+  (if (is-contract-owner)
+    (let ((final-risk (update-batch-risk-score batch-number risk-adjustment "manual-adjustment")))
+      (ok final-risk)
+    )
+    ERR-NOT-AUTHORIZED
+  )
+)
+
+(define-read-only (get-batch-analytics (batch-number (string-ascii 20)))
+  (map-get? batch-analytics { batch-number: batch-number })
+)
+
+(define-read-only (get-batch-risk-score (batch-number (string-ascii 20)))
+  (match (map-get? batch-analytics { batch-number: batch-number })
+    analytics (get risk-score analytics)
+    u0
+  )
+)
+
+(define-read-only (get-batch-risk-level (batch-number (string-ascii 20)))
+  (match (map-get? batch-analytics { batch-number: batch-number })
+    analytics (get risk-level analytics)
+    "unknown"
+  )
+)
+
+(define-read-only (get-location-risk-metrics (location (string-ascii 50)))
+  (map-get? location-risk-metrics { location: location })
+)
+
+(define-read-only (get-manufacturer-batch-stats (manufacturer principal))
+  (map-get? manufacturer-batch-stats { manufacturer: manufacturer })
+)
+
+(define-read-only (get-risk-alert (alert-id uint))
+  (map-get? risk-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-active-risk-alerts)
+  (fold filter-active-alerts (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) (list))
+)
+
+(define-private (filter-active-alerts (alert-id uint) (acc (list 10 { alert-id: uint, batch-number: (string-ascii 20), severity: (string-ascii 10) })))
+  (match (map-get? risk-alerts { alert-id: alert-id })
+    alert 
+      (if (not (get acknowledged alert))
+        (unwrap-panic (as-max-len? (append acc { alert-id: alert-id, batch-number: (get batch-number alert), severity: (get severity alert) }) u10))
+        acc
+      )
+    acc
+  )
+)
+
+(define-read-only (get-high-risk-batches)
+  (fold filter-high-risk-batches (list "BATCH-001" "BATCH-002" "BATCH-003" "BATCH-004" "BATCH-005") (list))
+)
+
+(define-private (filter-high-risk-batches (batch-number (string-ascii 20)) (acc (list 5 { batch: (string-ascii 20), risk-score: uint, risk-level: (string-ascii 10) })))
+  (match (map-get? batch-analytics { batch-number: batch-number })
+    analytics 
+      (if (>= (get risk-score analytics) u600)
+        (unwrap-panic (as-max-len? (append acc { batch: batch-number, risk-score: (get risk-score analytics), risk-level: (get risk-level analytics) }) u5))
+        acc
+      )
+    acc
+  )
+)
+
+(define-read-only (analyze-manufacturer-risk (manufacturer principal))
+  (match (map-get? manufacturer-batch-stats { manufacturer: manufacturer })
+    stats 
+      {
+        manufacturer: manufacturer,
+        risk-assessment: (if (> (get avg-batch-risk stats) u600) "high-risk" (if (> (get avg-batch-risk stats) u400) "medium-risk" "low-risk")),
+        total-batches: (get total-batches stats),
+        high-risk-percentage: (if (> (get total-batches stats) u0) (/ (* (get high-risk-batches stats) u100) (get total-batches stats)) u0),
+        manufacturing-quality: (get manufacturing-quality-score stats),
+        total-recalls: (get total-recalls stats)
+      }
+    { 
+      manufacturer: manufacturer, 
+      risk-assessment: "unknown", 
+      total-batches: u0, 
+      high-risk-percentage: u0, 
+      manufacturing-quality: u0, 
+      total-recalls: u0 
+    }
+  )
+)
+
+(define-read-only (get-location-risk-assessment (location (string-ascii 50)))
+  (match (map-get? location-risk-metrics { location: location })
+    metrics 
+      (let 
+        (
+          (success-rate (if (> (get total-events metrics) u0) (/ (* (get successful-transfers metrics) u100) (get total-events metrics)) u0))
+          (violation-rate (if (> (get total-events metrics) u0) (/ (* (get temperature-violations metrics) u100) (get total-events metrics)) u0))
+        )
+        {
+          location: location,
+          risk-tier: (if (< success-rate u70) "high-risk" (if (< success-rate u85) "medium-risk" "low-risk")),
+          success-rate: success-rate,
+          violation-rate: violation-rate,
+          total-events: (get total-events metrics),
+          avg-risk-score: (get avg-risk-score metrics)
+        }
+      )
+    { 
+      location: location, 
+      risk-tier: "unknown", 
+      success-rate: u0, 
+      violation-rate: u0, 
+      total-events: u0, 
+      avg-risk-score: u0 
+    }
+  )
+)
+
+(define-read-only (get-supply-chain-risk-overview)
+  (let 
+    (
+      (sample-batches (list "BATCH-001" "BATCH-002" "BATCH-003"))
+      (risk-scores (map get-batch-risk-score sample-batches))
+      (total-risk-score (fold + risk-scores u0))
+      (batch-count (len sample-batches))
+    )
+    {
+      total-batches-analyzed: batch-count,
+      average-risk-score: (if (> batch-count u0) (/ total-risk-score batch-count) u0),
+      total-alerts: (var-get alert-counter),
+      high-risk-batch-count: (len (get-high-risk-batches)),
+      system-risk-level: (if (> (/ total-risk-score batch-count) u600) "high" "normal")
+    }
+  )
+)
+
+(define-read-only (predict-batch-risk (batch-number (string-ascii 20)) (manufacturer principal) (planned-locations (list 3 (string-ascii 50))))
+  (let 
+    (
+      (manufacturer-stats (get total-recalls (default-to { total-batches: u0, high-risk-batches: u0, avg-batch-risk: u100, total-recalls: u0, manufacturing-quality-score: u1000 } (map-get? manufacturer-batch-stats { manufacturer: manufacturer }))))
+      (location-risks (map get-location-risk-score planned-locations))
+      (avg-location-risk (if (> (len planned-locations) u0) (/ (fold + location-risks u0) (len planned-locations)) u100))
+      (base-risk u200)
+      (predicted-risk (+ base-risk (* manufacturer-stats u10) (/ avg-location-risk u2)))
+    )
+    {
+      batch-number: batch-number,
+      predicted-risk-score: predicted-risk,
+      predicted-risk-level: (calculate-risk-level predicted-risk),
+      manufacturer-risk-factor: manufacturer-stats,
+      location-risk-factor: avg-location-risk,
+      recommendation: (if (> predicted-risk u600) "review-before-shipping" "proceed-with-monitoring")
+    }
+  )
+)
+
+(define-private (get-location-risk-score (location (string-ascii 50)))
+  (match (map-get? location-risk-metrics { location: location })
+    metrics (get avg-risk-score metrics)
+    u100
+  )
+)
+
+(define-read-only (get-critical-risk-alerts)
+  (fold filter-critical-alerts (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) (list))
+)
+
+(define-private (filter-critical-alerts (alert-id uint) (acc (list 10 { alert-id: uint, batch: (string-ascii 20), message: (string-ascii 100), timestamp: uint })))
+  (match (map-get? risk-alerts { alert-id: alert-id })
+    alert 
+      (if (and (is-eq (get severity alert) "critical") (not (get acknowledged alert)))
+        (unwrap-panic (as-max-len? (append acc { alert-id: alert-id, batch: (get batch-number alert), message: (get alert-message alert), timestamp: (get timestamp alert) }) u10))
+        acc
+      )
+    acc
+  )
+)
+
+(define-read-only (get-batch-performance-trends (batch-number (string-ascii 20)))
+  (match (map-get? batch-analytics { batch-number: batch-number })
+    analytics 
+      (let 
+        (
+          (risk-trend (if (> (get risk-score analytics) u400) "deteriorating" "stable"))
+          (transfer-success-rate (if (> (get total-transfers analytics) u0) (/ (* (- (get total-transfers analytics) (get failed-transfers analytics)) u100) (get total-transfers analytics)) u100))
+        )
+        {
+          batch-number: batch-number,
+          current-risk: (get risk-score analytics),
+          risk-trend: risk-trend,
+          transfer-success-rate: transfer-success-rate,
+          temperature-violations: (get avg-temp-violations analytics),
+          total-products: (get total-products analytics),
+          recall-status: (> (get products-recalled analytics) u0),
+          last-updated: (get last-updated analytics)
+        }
+      )
+    { 
+      batch-number: batch-number, 
+      current-risk: u0, 
+      risk-trend: "unknown", 
+      transfer-success-rate: u0, 
+      temperature-violations: u0, 
+      total-products: u0, 
+      recall-status: false, 
+      last-updated: u0 
+    }
   )
 )
