@@ -1234,3 +1234,200 @@
     }
   )
 )
+
+(define-data-var next-insurance-policy-id uint u1)
+(define-data-var next-insurance-claim-id uint u1)
+(define-data-var total-insurance-premiums uint u0)
+(define-data-var total-insurance-payouts uint u0)
+
+(define-map insurance-policies
+  { policy-id: uint }
+  {
+    policy-holder: principal,
+    product-id: uint,
+    batch-number: (optional (string-ascii 20)),
+    coverage-amount: uint,
+    premium-paid: uint,
+    policy-start: uint,
+    policy-end: uint,
+    risk-score: uint,
+    reputation-score: uint,
+    is-active: bool
+  }
+)
+
+(define-map policy-lookup
+  { product-id: uint, batch-number: (optional (string-ascii 20)) }
+  { policy-id: uint, is-active: bool }
+)
+
+(define-map insurance-claims
+  { claim-id: uint }
+  {
+    policy-id: uint,
+    event-type: uint,
+    claim-amount: uint,
+    is-paid: bool,
+    reporter: principal,
+    timestamp: uint,
+    reason: (optional (string-ascii 64))
+  }
+)
+
+(define-read-only (calculate-insurance-premium (coverage-amount uint) (risk-score uint) (reputation-score uint) (duration-blocks uint))
+  (if (or (is-eq coverage-amount u0) (is-eq duration-blocks u0) (> risk-score u100) (> reputation-score u100))
+    u0
+    (let 
+      (
+        (duration-factor (if (> duration-blocks u100) u100 duration-blocks))
+        (risk-factor (if (> (+ risk-score (- u100 reputation-score)) u5) (+ risk-score (- u100 reputation-score)) u5))
+        (base-premium (/ (* coverage-amount risk-factor) u1000))
+        (adjusted-premium (/ (* base-premium duration-factor) u100))
+        (minimum-premium u10000)
+      )
+      (if (< adjusted-premium minimum-premium) minimum-premium adjusted-premium)
+    )
+  )
+)
+
+(define-public (create-insurance-policy 
+  (product-id uint) 
+  (batch-number (optional (string-ascii 20))) 
+  (coverage-amount uint) 
+  (duration-blocks uint))
+  (let 
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR-PRODUCT-NOT-FOUND))
+      (participant-metrics (default-to 
+        { quality-score: u1000, reputation-tier: "new" } 
+        (map-get? participant-quality-metrics { participant: tx-sender })))
+      (batch-risk (if (is-some batch-number) 
+                    (get-batch-risk-score (unwrap-panic batch-number)) 
+                    u100))
+      (risk-score (/ (+ batch-risk u100) u2))
+      (reputation-score (/ (get quality-score participant-metrics) u10))
+      (premium (calculate-insurance-premium coverage-amount risk-score reputation-score duration-blocks))
+      (existing-policy (default-to { policy-id: u0, is-active: false } 
+                        (map-get? policy-lookup { product-id: product-id, batch-number: batch-number })))
+    )
+    (if (or (is-eq premium u0) (get is-active existing-policy))
+      (err u400)
+      (let 
+        (
+          (policy-start stacks-block-height)
+          (policy-end (+ stacks-block-height duration-blocks))
+          (new-policy-id (var-get next-insurance-policy-id))
+        )
+        (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+        (map-set insurance-policies
+          { policy-id: new-policy-id }
+          {
+            policy-holder: tx-sender,
+            product-id: product-id,
+            batch-number: batch-number,
+            coverage-amount: coverage-amount,
+            premium-paid: premium,
+            policy-start: policy-start,
+            policy-end: policy-end,
+            risk-score: risk-score,
+            reputation-score: reputation-score,
+            is-active: true
+          }
+        )
+        (map-set policy-lookup
+          { product-id: product-id, batch-number: batch-number }
+          { policy-id: new-policy-id, is-active: true }
+        )
+        (var-set next-insurance-policy-id (+ new-policy-id u1))
+        (var-set total-insurance-premiums (+ (var-get total-insurance-premiums) premium))
+        (ok { policy-id: new-policy-id, premium-paid: premium })
+      )
+    )
+  )
+)
+
+(define-public (file-insurance-claim 
+  (product-id uint) 
+  (batch-number (optional (string-ascii 20))) 
+  (event-type uint) 
+  (reason (optional (string-ascii 64))))
+  (let 
+    (
+      (policy-lookup-result (map-get? policy-lookup { product-id: product-id, batch-number: batch-number }))
+    )
+    (if (is-none policy-lookup-result)
+      (err u404)
+      (let 
+        (
+          (lookup-data (unwrap! policy-lookup-result (err u404)))
+          (policy-id (get policy-id lookup-data))
+          (policy-data (unwrap! (map-get? insurance-policies { policy-id: policy-id }) (err u404)))
+        )
+        (if (or 
+              (not (get is-active policy-data)) 
+              (< stacks-block-height (get policy-start policy-data)) 
+              (> stacks-block-height (get policy-end policy-data)))
+          (err u405)
+          (let 
+            (
+              (event-severity (if (is-eq event-type u1) u20 (if (is-eq event-type u2) u10 u15)))
+              (risk-adjustment (/ (+ (get risk-score policy-data) (- u100 (get reputation-score policy-data))) u2))
+              (total-factor (+ event-severity risk-adjustment))
+              (payout-rate (if (> total-factor u100) u100 total-factor))
+              (claim-amount (/ (* (get coverage-amount policy-data) payout-rate) u100))
+              (available-balance (as-contract (stx-get-balance tx-sender)))
+              (new-claim-id (var-get next-insurance-claim-id))
+            )
+            (if (or (is-eq claim-amount u0) (> claim-amount available-balance))
+              (err u406)
+              (begin
+                (map-set insurance-claims
+                  { claim-id: new-claim-id }
+                  {
+                    policy-id: policy-id,
+                    event-type: event-type,
+                    claim-amount: claim-amount,
+                    is-paid: true,
+                    reporter: tx-sender,
+                    timestamp: stacks-block-height,
+                    reason: reason
+                  }
+                )
+                (var-set next-insurance-claim-id (+ new-claim-id u1))
+                (var-set total-insurance-payouts (+ (var-get total-insurance-payouts) claim-amount))
+                (map-set policy-lookup
+                  { product-id: product-id, batch-number: batch-number }
+                  { policy-id: policy-id, is-active: false }
+                )
+                (map-set insurance-policies
+                  { policy-id: policy-id }
+                  (merge policy-data { is-active: false })
+                )
+                (try! (as-contract (stx-transfer? claim-amount tx-sender (get policy-holder policy-data))))
+                (ok new-claim-id)
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-insurance-policy (policy-id uint))
+  (map-get? insurance-policies { policy-id: policy-id })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-insurance-stats)
+  {
+    total-policies: (var-get next-insurance-policy-id),
+    total-claims: (var-get next-insurance-claim-id),
+    total-premiums: (var-get total-insurance-premiums),
+    total-payouts: (var-get total-insurance-payouts),
+    available-reserves: (as-contract (stx-get-balance tx-sender))
+  }
+)
